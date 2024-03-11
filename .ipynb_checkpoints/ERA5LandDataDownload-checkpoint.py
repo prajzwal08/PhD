@@ -1,20 +1,18 @@
-variables = [‘Total evaporation’,’Volumetric soil water layer 1’,’Volumetric soil water layer 2’,’Volumetric soil water layer 3’,’Volumetric soil water layer 4’]import itertools
+import itertools
 import cdsapi
 import os 
 
-output_dir = "output"
+output_dir = "/home/khanalp/task1/data/ERA5Land"
 
 c = cdsapi.Client()
 
-variables = ['2m_temperature' , 'total_precipitation', '2m_dewpoint_temperature',
-            'surface_pressure', 'surface_solar_radiation_downwards',
-            'surface_thermal_radiation_downwards','10m_u_component_of_wind',
-            '10m_v_component_of_wind']
+variables = ['soil_temperature_level_3', 'soil_temperature_level_4']
 
-years = list(range(2012, 2023))            
+years = list(range(2016, 2017))            
 #years = [2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022]
-months = ["01","02","03","04","05","06","07","08","09","10","11","12"]
-location = [50.681189,2.932320,53.915328,7.347674]
+#months = ["01","02","03","04","05","06","07","08","09","10","11","12"]
+months = ["01"]
+location = [35.8149, -25.0, 71.1851, 44.7909]
 
 for var, year, month in itertools.product(variables, years, months):
     # Create an "output" directory if it doesn't exist
@@ -37,7 +35,6 @@ for var, year, month in itertools.product(variables, years, months):
                 "01", "02", "03",
                 "04", "05", "06",
                 "07", "08", "09",
-                "10", "11", "12",
                 "13", "14", "15",
                 "16", "17", "18",
                 "19", "20", "21",
@@ -61,3 +58,4 @@ for var, year, month in itertools.product(variables, years, months):
         },
          output_file_path
     )
+

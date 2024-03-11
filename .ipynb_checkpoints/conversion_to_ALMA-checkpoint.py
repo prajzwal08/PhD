@@ -1,0 +1,581 @@
+import os
+import pandas as pd
+import re
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import glob
+from scipy.interpolate import CubicSpline
+from scipy import interpolate
+from scipy.signal import savgol_filter
+
+def list_folders_with_prefix(location, prefix):
+    """
+    Retrieves a list of folder names within the specified location directory that start with the provided prefix.
+    
+    Parameters:
+        location (str): The directory path where the function will search for folders.
+        prefix (str): The prefix that the desired folders should start with.
+    
+    Returns:
+        list: A list of folder names starting with the specified prefix within the given location.
+    """
+    folders_with_prefix = [folder for folder in os.listdir(location) if os.path.isdir(os.path.join(location, folder)) and folder.startswith(prefix)]
+    return folders_with_prefix
+
+def list_csv_files_in_folder(folder_path, keyword):
+    """
+    Retrieves a list of file paths for CSV files within the specified folder_path directory that contain the provided keyword in their filenames.
+    
+    Parameters:
+        folder_path (str): The directory path where the function will search for CSV files.
+        keyword (str): The keyword that the filenames of desired CSV files should contain.
+    
+    Returns:
+        list: A list of file paths for CSV files containing the specified keyword within the given folder_path.
+    """
+    csv_files = [os.path.join(folder_path, file) for file in os.listdir(folder_path) if file.endswith('.csv') and keyword in file]
+    return csv_files
+
+def replace_negative_with_mean_of_nearest(arr):
+    """
+    Replaces negative values in the input array with the mean of the nearest non-negative values.
+    
+    Parameters:
+        arr (numpy.ndarray): Input array.
+    
+    Returns:
+        numpy.ndarray: Array with negative values replaced by the mean of the nearest non-negative values.
+    """
+    neg_indices = np.where(arr < 0)[0]  # Get indices where values are less than zero
+    for i in neg_indices:
+        # Find nearest non-negative values before and after the negative value
+        left_index = i - 1
+        while left_index in neg_indices:
+            left_index -= 1
+        right_index = i + 1
+        while right_index in neg_indices:
+            right_index += 1
+    
+        # Replace negative value with the mean of the nearest non-negative values
+        arr[i] = np.mean([arr[left_index], arr[right_index]])
+    
+    return arr
+
+def get_cams_co2_data(longitude, latitude, start_time, end_time, file_path):
+    """
+    Retrieve CAMS CO2 data for a specific location and time period.
+    
+    Parameters:
+    longitude (float): Longitude of the location.
+    latitude (float): Latitude of the location.
+    start_time (str): Start time in the format 'YYYY-MM-DD'.
+    end_time (str): End time in the format 'YYYY-MM-DD'.
+    file_path (str): Path to the CAMS netCDF file.
+    
+    Returns:
+    co2_data (np.ndarray): Array of CO2 data.
+    """
+     # Constants
+    M_CO2 = 44.01  # Molar mass of CO2 in g/mol
+    M_dry_air = 28.97  # Molar mass of dry air in g/mol
+    
+     # Conversion factor from kg/kg to ppm
+    conversion_factor = 1e6  # ppm
+    
+    # Open the CAMS dataset
+    cams = xr.open_dataset(file_path).sortby('time')
+    
+    # Select the nearest location to the provided longitude and latitude
+    cams_location_selected = cams.sel(latitude=latitude, longitude=longitude, method='nearest')
+    
+    # Select the time range
+    cams_date_selected = cams_location_selected.sel(time=slice(start_time, end_time))
+    
+    # Extract time and CO2 variables
+    time_data = cams_date_selected['time'].values
+    co2_data = cams_date_selected['co2'].values.reshape(-1)
+    
+    # Create a pandas DataFrame
+    df = pd.DataFrame({'time': time_data, 'co2': co2_data})
+    
+    # Set 'time' column as index
+    df.set_index('time', inplace=True)
+    
+    # Resample to 30-minute intervals and forward fill missing values
+    df_filled = df.resample('30min').ffill()
+    
+    # Extend the index until 'end_time' and forward fill
+    end_date_extend = pd.to_datetime(end_time)
+    df_filled_new = df_filled.reindex(pd.date_range(start=df_filled.index.min(), end=end_date_extend, freq='30min')).ffill()
+    
+    # Extract CO2 data as numpy array
+    co2 = np.array(df_filled_new['co2'])
+    
+    # Convert kg/kg to ppm
+    co2_ppm = co2 * (conversion_factor * M_dry_air / M_CO2)
+    
+    return co2_ppm
+    
+def calculate_RH_and_q(vpd, Tair, pressure):
+    """
+    Calculate relative humidity (RH) and specific humidity (q) from input vpd, Tair, and pressure.
+    
+    Parameters:
+    vpd (array-like): Array of vapor pressure deficit values.
+    Tair (array-like): Array of air temperature values (in Celsius).
+    pressure (array-like): Array of air pressure values (in KPa).
+    
+    Returns:
+    RH (array-like): Array of relative humidity values.
+    q (array-like): Array of specific humidity values.
+    """
+    
+    # Gas constant of dry air and vapor.
+    Rd = 287.058
+    Rv = 461.5
+     
+    # Calculating saturation vapor pressure (es) from the Tair.
+    es = 0.6108 * np.exp((17.27 * Tair) / (Tair + 237.3)) * 10 #mutilplied by 10 to get hPa from kPa.
+    
+    # Calculating the actual vapor pressure from es and vpd and then RH.
+    ea = es - vpd
+    RH = (ea / es) * 100
+    #some values are negative so. 
+    RH_modified = replace_negative_with_mean_of_nearest(RH)
+    
+    # Calculating the specific humidity (q) from ea.
+    w = ea * Rd / (Rv * (pressure * 10 - ea))  # Since pressure in KPa, ea in hPa, same as VPD.
+    q = w / (w + 1)
+    qair_modified = replace_negative_with_mean_of_nearest(q)
+    
+    return RH_modified, qair_modified
+     
+def get_spatial_weighted_LAI(lai_pixel, sd_pixel, qc_pixel):
+    """
+    Calculates the spatially weighted Leaf Area Index (LAI) based on the input LAI values, standard deviation (SD) values, and quality control (QC) flags.
+    
+    Parameters:
+        lai_pixel (numpy.ndarray): Array containing the LAI values for each pixel.
+        sd_pixel (numpy.ndarray): Array containing the standard deviation values for each pixel.
+        qc_pixel (numpy.ndarray): Array containing the quality control flags for each pixel.
+    
+    Returns:
+        numpy.ndarray: Array containing the spatially weighted LAI values.
+    """
+    # Use only good quality data
+    
+    qc_flags = [0, 2, 24, 26, 32, 34, 56, 58]
+    
+    # Mask the quality flag
+    mask = np.isin(qc_pixel, qc_flags)
+    lai_pixel[~mask] = np.nan
+    sd_pixel[~mask] = np.nan
+    
+    # Mask out where sd is really low (likely cloud effects)
+    sd_pixel[sd_pixel < 0.1] = np.nan
+    lai_pixel[np.isnan(sd_pixel)] = np.nan
+    
+    # Set the values above threshold to missing
+    lai_pixel[lai_pixel > 10] = np.nan
+    
+    # Calculate weights, ignoring NaN values
+    weights = (1 / sd_pixel**2) / np.nansum(1 / sd_pixel**2, axis=1, keepdims=True)
+    
+    # Element-wise multiplication of lai_pixel and weights
+    weighted_lai_values = lai_pixel * weights
+    
+    # Calculate the weighted mean for each row, ignoring NaN values
+    weighted_lai = np.nanmean(weighted_lai_values, axis=1)
+    
+    return weighted_lai
+
+def interpolate_NA_LAI(unfilled_lai):
+    """
+    Interpolates missing values (NaNs) in a given array of LAI (Leaf Area Index) using cubic interpolation and caps negative values to zero.
+    
+    Parameters:
+        unfilled_lai (numpy.ndarray): Array containing LAI values with missing values represented as NaNs.
+    
+    Returns:
+        numpy.ndarray: Array with missing values filled using interpolation and negative values capped at zero.
+    """
+    filled_lai = unfilled_lai.copy()
+    
+    # Create a mask for NaN values
+    nan_mask = np.isnan(unfilled_lai)
+    
+    # Generate an index array for values
+    x = np.arange(len(unfilled_lai))
+    
+    # Interpolate only at the positions where NaNs are present
+    interp_func = interpolate.interp1d(x[~nan_mask], unfilled_lai[~nan_mask], kind='cubic', fill_value="extrapolate")
+    
+    # Extrapolate the NaN values
+    filled_lai[nan_mask] = interp_func(x)[nan_mask]
+    
+    # Cap negative values to zero
+    filled_lai[filled_lai < 0] = 0
+    
+    # Set the last observation to zero
+    filled_lai[-1] = 0
+    
+    return filled_lai
+
+def check_data_availability_LAI(filled_lai,lai_time):
+    """
+    Checks the availability of MODIS LAI data and fills missing values if necessary. It ensures that the provided time range matches the expected range for MODIS observations.
+    
+    Parameters:
+        filled_lai (numpy.ndarray): Array containing MODIS LAI data.
+        lai_time (pandas.Series): Series containing timestamps corresponding to the MODIS LAI data.
+    
+    Returns:
+        tuple: A tuple containing the filled LAI data and the corresponding dates.
+    """
+    
+    # Check if filled_lai has no NAs or not, because sometimes MODIS observations are missing in between.
+    all_tsteps = []
+    
+    # Loop over each year from start to end of MODIS data 
+    for year in range(lai_time.dt.year.min(), lai_time.dt.year.max()+1):
+        # Generate the first two dates for the year
+        #year_dates = pd.date_range(start=f"{year}-01-01", periods=2, freq='8D')
+        
+        # Ensure 46 evenly spaced dates for the rest of the year
+        year_dates = pd.date_range(start=f"{year}-01-01", end=f"{year}-12-31", freq='8D')
+        
+        # Append the datetime series for the current year to the list
+        all_tsteps.extend(year_dates)
+    
+    #Change to pd datetime. 
+    all_time = pd.to_datetime(all_tsteps)
+    #Check if all date spaced 8 days apart are present in original MODIS lai_time. 
+    result = all_time.isin(lai_time)
+    
+    temp_array = np.full(result.shape, np.nan)
+    
+    # Fill new array based on the condition of result.
+    #This basically fills the point after checking date. 
+    fill_index = 0
+    for i, val in enumerate(result):
+        if val:
+            temp_array[i] = filled_lai[fill_index]
+            fill_index += 1
+    
+    selected_lai = temp_array.reshape(-1, 46)[1:-1] #Basically because each year MODIS has 46 observations, if all are available.
+    # Select dates from 2003 to 2022
+    selected_dates = all_time[(all_time.year >= 2003) & (all_time.year <= 2023)]
+    
+    if len(np.isnan(selected_lai).flatten()) > 0:
+        selected_lai_flatten = selected_lai.reshape(-1)
+        positions = np.where(np.isnan(selected_lai_flatten))[0]
+    
+        if len(positions) > 0:
+            for position in positions:
+                selected_lai_flatten[position] = (selected_lai_flatten[position-1]+selected_lai_flatten[position+1])/2 #filling with the average of two nearest value
+            gap_free_lai = selected_lai_flatten.reshape(-1, 46)
+            return gap_free_lai,selected_dates
+    else:
+        return selected_lai,selected_dates
+
+# Function to calculate rolling mean along rows
+def rolling_mean(array, window):
+    """
+    Calculates the rolling mean along a 1D numpy array.
+    
+    Parameters:
+        array (numpy.ndarray): Input 1D array.
+        window (int): Size of the rolling window.
+    
+    Returns:
+        numpy.ndarray: Resultant array after applying the rolling mean.
+    """
+    result = np.full_like(array, np.nan)
+    for i in range(array.shape[0]):
+        start_index = max(0, i - window // 2)
+        end_index = min(array.shape[0], i + (window + 1) // 2)
+        result[i] = np.mean(array[start_index:end_index], axis=0)
+    return result
+
+def smoothing_LAI(gap_free_lai):
+    """
+    Smoothes the gap-free LAI data by calculating climatology, removing mean climatology to obtain anomalies,
+    and applying a rolling mean to the anomalies with a window of +/- 6 months. Finally, it adds the smoothed anomalies
+    back to the climatology to obtain smoothed LAI values.
+    
+    Parameters:
+        gap_free_lai (numpy.ndarray): Array containing gap-free LAI data.
+    
+    Returns:
+        numpy.ndarray: Smoothed LAI values.
+    """
+    # Calculate the mean of each column ignoring NaNs (climatology)
+    column_means = np.nanmean(gap_free_lai, axis=0)
+    smoothed_column_means = savgol_filter(column_means, window_length = 13, polyorder = 3)
+    # Calculate the anomaly after removing mean climatology. 
+    anomaly = gap_free_lai - column_means
+    # Calculate running mean anomaly (+/- 6 months either side of each time step)
+    anomaly_rolling = rolling_mean(anomaly.flatten(), 13)
+    smoothed_lai = anomaly_rolling + np.tile(smoothed_column_means,(anomaly.shape[0]))
+    return smoothed_lai
+
+def get_LAI(modis_path,station_name,start_date,end_date):
+    """
+    Retrieves Leaf Area Index (LAI) data from MODIS files for a specific station and time range. 
+    The function performs data preprocessing steps including spatial weighting, interpolating missing values, 
+    checking data availability, smoothing LAI, and resampling to match the resolution of the flux tower data.
+    
+    Parameters:
+        modis_path (str): Path to the directory containing MODIS files.
+        station_name (str): Name of the station.
+        start_date (str): Start date of the desired time range (format: 'YYYY-MM-DD').
+        end_date (str): End date of the desired time range (format: 'YYYY-MM-DD').
+    
+    Returns:
+        numpy.ndarray: Array containing the smoothed LAI values.
+    """
+    
+    lai_file = glob.glob(f"{modis_path}/{station_name}_MCD15A2H_Lai_500m_*")
+    qc_file = glob.glob(f"{modis_path}/{station_name}_MCD15A2H_FparLai_QC*")
+    sd_file = glob.glob(f"{modis_path}/{station_name}_MCD15A2H_LaiStdDev_500m_*")
+    
+    lai = pd.read_csv(lai_file[0])
+    qc = pd.read_csv(qc_file[0])
+    sd = pd.read_csv(sd_file[0])
+    # Get the number of timesteps
+    no_tsteps = min(len(lai), len(sd), len(qc)) // max(lai['pixel'])
+    
+    # Extracting pixels in the centre and immediately around it
+    pixel_no = [7, 8, 9, 12, 13, 14, 17, 18, 19]
+    
+    # Extract 3x3 pixels
+    lai_pixel = np.full((no_tsteps, len(pixel_no)), np.nan)
+    sd_pixel = np.full((no_tsteps, len(pixel_no)), np.nan)
+    qc_pixel = np.full((no_tsteps, len(pixel_no)), np.nan)
+    # Save time stamps
+    lai_time = pd.to_datetime(lai.loc[lai['pixel'] == pixel_no[0], 'calendar_date'])
+    
+    # Loop through pixels
+    for idx, p in enumerate(pixel_no):
+        #Get time series for pixel and scale using scale factor
+        lai_pixel[:, idx] = lai.loc[lai['pixel'] == p, 'value'].values[:no_tsteps] * lai.loc[lai['pixel'] == p, 'scale'].values[0]
+        sd_pixel[:, idx] = sd.loc[sd['pixel'] == p, 'value'].values[:no_tsteps] * sd.loc[sd['pixel'] == p, 'scale'].values[0]
+        qc_pixel[:, idx] = qc.loc[qc['pixel'] == p, 'value'].values[:no_tsteps]
+    
+    #print("Spatial Weighing started")
+    weighted_lai_values = get_spatial_weighted_LAI(lai_pixel,sd_pixel,qc_pixel)
+    #print("Interpolating NAs")
+    filled_lai = interpolate_NA_LAI(weighted_lai_values)
+    #print("checking data availability")
+    gap_free_lai, selected_dates = check_data_availability_LAI(filled_lai,lai_time)
+    #print("Smoothing LAI")
+    smooth_lai = smoothing_LAI(gap_free_lai)
+    
+    df_lai = pd.DataFrame({'Date':selected_dates, 'LAI' :smooth_lai})
+    
+    #Setting Date column as index to do resample to 30 mins, which is the resolution of flux tower.
+    df_lai.set_index('Date', inplace=True)
+    df_filled = df_lai.resample('30min').ffill() #This does not have date beyond 2020-12-26. 
+    
+    # Reindex to extend the index until '2020-12-31' and forward fill
+    end_date_extend = pd.to_datetime('2023-12-31 23:30:00')
+    df_filled = df_filled.reindex(pd.date_range(start=df_filled.index.min(), end=end_date_extend, freq='30min')).ffill()
+    
+    filtered_df = df_filled[(df_filled.index >= start_date) & (df_filled.index <= end_date)]
+    lai_array = filtered_df['LAI'].values
+    
+    return lai_array
+
+#These are to list the csv files of the ICOS stations. 
+# Define paths and parameters
+modis_path = "/home/khanalp/task1/data/MODIS_Raw/MODIS_Raw"
+cams_path = "/home/khanalp/task1/data/cams/cams_europe.nc"
+ICOS_location = "/home/khanalp/task1/data/"
+output_directory = '/home/khanalp/task1/data/ICOS/Input_data'
+prefix = "FLX"
+
+
+#selecting required variables from ICOS data for input.
+variables = [
+    'TIMESTAMP_START',
+    'TA_F',
+    'TA_F_QC',
+    'SW_IN_F',
+    'SW_IN_F_QC',
+    'LW_IN_F',
+    'LW_IN_F_QC',
+    'VPD_F',
+    'VPD_F_QC',
+    'PA_F',
+    'PA_F_QC',
+    'P_F',
+    'P_F_QC',
+    'WS_F',
+    'WS_F_QC',
+    'RH',
+    'CO2_F_MDS',
+    'CO2_F_MDS_QC' 
+]
+
+#Renaming them 
+rename = {'TA_F':'Tair',
+          'TA_F_QC':'Tair_qc',
+          'SW_IN_F':'SWdown',
+          'SW_IN_F_QC':'SWdown_qc',
+          'LW_IN_F':'LWdown',
+          'LW_IN_F_QC':'LWdown_qc',
+          'VPD_F':'VPD',
+          'VPD_F_QC':'VPD_qc',
+          'PA_F':'Psurf',
+          'PA_F_QC':'Psurf_qc',
+          'P_F' : 'Precip',
+          'P_F_QC':'Precip_qc',
+          'WS_F':'Wind',
+          'WS_F_QC':'Wind_qc',
+          'CO2_F_MDS':'CO2air',
+          'CO2_F_MDS_QC':'CO2air_qc'
+         }
+
+folders = list_folders_with_prefix(ICOS_location, prefix)
+
+csv_files_with_keyword = []
+for folder in folders:
+    folder_path = os.path.join(ICOS_location, folder)
+    csv_files_with_keyword.extend(list_csv_files_in_folder(folder_path, "FULLSET_HH"))
+
+# This contains all the stations of the ICOS with information like plant canopy height, measurement height, etc. 
+station_all = pd.read_excel("station_with_elevation_heightcanopy.xlsx")
+# Set the "station_name" column as the index
+station_all = station_all.set_index('station_name')
+
+# selected_stations contains the stations with no NA values"
+selected_station = pd.read_csv("sites_with_noNAs.csv", index_col= 0)
+
+# These are station for which we will drive the model. 
+station = station_all[station_all.index.isin(selected_station.index)]
+
+# Initialize an empty dictionary to store station_name, latitude, and longitude and other information..
+station_dict = {}
+# Iterate over each row in the DataFrame
+for index, row in station.iterrows():
+    # Extract the station_name and position
+    station_name = index
+    latitude = row['latitude']
+    longitude = row['longitude']
+    elevation = row['elevation']
+    IGBP_longname = row['IGBP long name']
+    IGBP_shortname = row['IGBP short name']
+    #start_year = row['Start_Year_Threshold']
+    #end_year = row['End_Year_Threshold']
+    
+    # Extract height_canopy from 'height_canopy_field_information' column or 'height_canopy_ETH' column
+    height_canopy = row['height_canopy_field_information']
+    if pd.isna(height_canopy):  # Check if height_canopy_field_information is NaN
+        height_canopy = row['height_canopy_ETH']
+
+    measurement_height = row['Measurement height']
+    
+    # Store the station_name, latitude, and longitude in the dictionary
+    station_dict[station_name] = {
+        'latitude': latitude, 
+        'longitude': longitude, 
+        'elevation' : elevation,
+        'IGBP_longname': IGBP_longname,
+        'IGBP_shortname': IGBP_shortname,
+        'height_canopy': height_canopy,
+        'measurement_height': measurement_height,
+    }
+
+for station_name, station_info in station_dict.items():
+    print(f"{station_name}_started")
+    for item in csv_files_with_keyword:
+        if station_name in item:
+            selected_item = item
+            break
+            
+    # read ICOS data for station_name. 
+    df = pd.read_csv(selected_item)
+
+    # Make xraay dataaset
+    xds = xr.Dataset.from_dataframe(df)
+
+    # Select variables and rename them.
+    xds_renamed = xds[variables].rename(rename)
+    
+    #Making date and time as index; renaming index to time
+    xds_indexed = xds_renamed.assign_coords(index=pd.to_datetime(xds_renamed['TIMESTAMP_START'], format='%Y%m%d%H%M')).rename({'index':'time'})
+   # Adding x,y to the dimensions; also dropping variable 'TIMESTAMP_START' because its already indexed
+    xds_dimension = xds_indexed.expand_dims({'x': [1], 'y': [2]}).drop_vars('TIMESTAMP_START')
+    #Converting x,y to float64 
+    xds_dimension['x'] = xds_dimension['x'].astype('float64')
+    xds_dimension['y'] = xds_dimension['y'].astype('float64')
+
+    # Assign the coordinate arrays to the dataset
+    xds_dimension = xds_dimension.assign_coords({'x': [station_info['longitude']]  , 'y': [station_info['latitude']]})
+    # Convert the desired date to a pandas Timestamp
+    
+    # Get the minimum time value in the dataset
+    min_time = pd.Timestamp(xds_dimension.time.min().values)
+
+    # Set the start_date to 2012-01-01 if the minimum time is before 2012, otherwise keep it the same
+    start_date = pd.Timestamp('2012-01-01 00:00:00') if min_time < pd.Timestamp('2012-01-01') else min_time
+    
+    # Select data from 'xds_dimension' after the start_date
+    xds_dimension = xds_dimension.sel(time=slice(start_date, None))
+
+    counts = {var: np.count_nonzero(xds_dimension[var].values == -9999) for var in xds_dimension.data_vars}
+
+    # #Grabbing input vpd,Tair, pressure
+    vpd = xds_dimension.VPD.values.flatten()
+    Tair = xds_dimension.Tair.values.flatten()
+    pressure = xds_dimension .Psurf.values.flatten()
+
+    # calculating RH and q 
+    RH, q = calculate_RH_and_q(vpd, Tair, pressure)
+    
+    if counts['RH'] > 0: 
+        xds_dimension['Qair'] = xr.DataArray(q.reshape(1,1,-1), dims=['x','y','time'])
+        xds_dimension['RH'] = xr.DataArray(RH.reshape(1,1,-1), dims=['x','y','time']) 
+    else: 
+        xds_dimension['Qair'] = xr.DataArray(q.reshape(1,1,-1), dims=['x','y','time'])
+
+    if counts['CO2air'] > 0:
+        #getting cams data 
+        co2 = get_cams_co2_data(xds_dimension['x'], xds_dimension['y'], xds_dimension.time.min().values, xds_dimension.time.max().values, cams_path)
+        xds_dimension['CO2air'] = xr.DataArray(co2.reshape(1,1,-1), dims=['x','y','time'])
+        
+    # getting LAI    
+    lai = get_LAI(modis_path,station_name,xds_dimension.time.values.min(),xds_dimension.time.values.max())
+    xds_dimension['LAI'] = xr.DataArray(lai.reshape(1,1,-1), dims=['x','y','time'])
+    xds_dimension['LAI_alternative'] = xr.DataArray(lai.reshape(1,1,-1), dims=['x','y','time']) #later replace with copernicus LAI. 
+
+    #getting remaining variables in xarray.
+    xds_dimension['latitude'] = xr.DataArray(np.array(station_info['latitude']).reshape(1,-1), dims=['x','y'])
+    xds_dimension['longitude'] = xr.DataArray(np.array(station_info['longitude']).reshape(1,-1), dims=['x','y'])
+    xds_dimension['reference_height'] = xr.DataArray(np.array(station_info['measurement_height']).reshape(1,-1), dims=['x','y'])
+    xds_dimension['canopy_height'] = xr.DataArray(np.array(station_info['height_canopy']).reshape(1,-1), dims=['x','y'])
+    xds_dimension['elevation'] = xr.DataArray(np.array(station_info['elevation']).reshape(1,-1), dims=['x','y'])
+    xds_dimension['IGBP_veg_short'] = xr.DataArray(np.array(station_info['IGBP_shortname'], dtype = 'S200'))
+    xds_dimension['IGBP_veg_long'] = xr.DataArray(np.array(station_info['IGBP_longname'], dtype = 'S200'))
+    
+    # Ensuring all variables in float32 format. 
+    for var_name in xds_dimension.data_vars:
+        if var_name not in ['IGBP_veg_short', 'IGBP_veg_long']:
+            xds_dimension[var_name] = xds_dimension[var_name].astype('float32')
+
+    # Changing the units (for other, they are in the unit same as Plumber2)
+    xds_dimension['Precip'] = xds_dimension['Precip'] / (30*60) # changing from mm of 30 mins to mm/s. 
+    xds_dimension['Tair'] = xds_dimension['Tair'] + 273.15 # degree C to kelvin
+    xds_dimension['Psurf'] = xds_dimension['Psurf']*1000 #kPa to Pa
+
+    
+    #Saving file
+    min_year = xds_dimension.time.dt.year.min().item()
+    max_year = xds_dimension.time.dt.year.max().item()
+    file_name = f"{station_name}_{min_year}-{max_year}_FLUXNET2015_Met.nc"
+    xds_dimension.to_netcdf(os.path.join(output_directory, file_name))
+    print(f"{station_name}_completed")
+
+
+    
